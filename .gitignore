@@ -1,0 +1,13 @@
+# Arduino IDE build output
+build/
+*.hex
+*.elf
+*.bin
+
+# Arduino IDE metadata
+.vscode/
+*.tmp
+
+# OS cruft
+.DS_Store
+Thumbs.db
