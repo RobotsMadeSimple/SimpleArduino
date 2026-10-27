@@ -5,7 +5,7 @@
 // Serial protocol (115200 baud, newline-terminated ASCII lines):
 //
 //  HOST → NANO
-//    ID?                         Request device identifier
+//    ID?                         Request device identifier, firmware version and capabilities
 //    GET                         Get full state of all configured pins
 //    CFG:<pin>,<type>[,<count>]  Configure pin  (I=Input, O=Output, N=Neopixel)
 //    CFG:<dtPin>,L,<sckPin>      Configure HX711 load cell (DT=dtPin, SCK=sckPin)
@@ -13,7 +13,16 @@
 //    NEO:<pin>,<r0>,<g0>,<b0>,<r1>,<g1>,<b1>,...  Set neopixel pixel colours
 //
 //  NANO → HOST
-//    ID:<identifier>             Response to ID?
+//    ID:<identifier>;fw=<major.minor.patch>;caps=<cap1,cap2,...>
+//                                Response to ID? — one line. The `ID:<identifier>` prefix is
+//                                byte-for-byte what pre-1.1.0 firmware sent, so old controllers
+//                                still match; a controller that sees no `;fw=` treats the board
+//                                as legacy (unknown capabilities). Capability names (lowercase,
+//                                comma-separated, no spaces):
+//                                  io        digital input/output pins (CFG/GET/SET/CHG/STATE)
+//                                  neopixel  CFG type N + NEO
+//                                  loadcell  CFG type L + LC streaming
+//                                  stepper   M/C/S/X/E/D axis commands (not on this board)
 //    STATE:<pin>,<t>,<v>;...     Full pin state (t: I/O/N, v: 0 or 1; L: v is raw count)
 //    CHG:<pin>,<val>             Input pin changed value
 //    LC:<pin>,<raw>              HX711 load-cell raw 24-bit reading (signed), streamed each sample
@@ -32,6 +41,12 @@
 
 // Change this identifier to match the nano_config.json entry for this device.
 #define DEVICE_ID "ROBOT_NANO_001"
+
+// Firmware version (semantic): bump patch for fixes, minor when a capability/command is
+// added, major when the protocol changes incompatibly. 1.0.0 is the un-versioned firmware.
+#define FW_VERSION "1.1.0"
+// Capabilities advertised in the ID? reply (see protocol block above).
+#define FW_CAPS    "io,neopixel,loadcell"
 
 #define SERIAL_BAUD     115200
 #define MAX_PINS        20      // Arduino Nano has D0-D13, A0-A7 (mapped 14-21)
@@ -123,7 +138,8 @@ void handleCommand(const String& line)
 {
     // ── ID? ───────────────────────────────────────────────────────────────────
     if (line == "ID?") {
-        Serial.println("ID:" DEVICE_ID);
+        // One line; literals concatenated at compile time, no String allocation.
+        Serial.println("ID:" DEVICE_ID ";fw=" FW_VERSION ";caps=" FW_CAPS);
         return;
     }
 

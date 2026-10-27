@@ -7,7 +7,7 @@
 // Serial protocol (115200 baud, newline-terminated ASCII):
 //
 //  HOST -> ARDUINO
-//    ID?                                  Request device identifier
+//    ID?                                  Request device identifier, firmware version and capabilities
 //    E:<0|1>                              Enable (1) or disable (0) all drivers
 //    D:<axis>,<dir>                       Set direction — axis 0-3, dir 0=CW 1=CCW
 //    M:<axis>,<steps>,<vel>,<acc>,<dec>   Indexed move: trapezoidal profile
@@ -28,7 +28,16 @@
 //
 //  ARDUINO -> HOST
 //    RDY                  On boot
-//    ID:AUX_STEPPER_001   Response to ID?
+//    ID:AUX_STEPPER_001;fw=<major.minor.patch>;caps=<cap1,cap2,...>
+//                         Response to ID? — one line. The `ID:<identifier>` prefix is
+//                         byte-for-byte what pre-1.1.0 firmware sent, so old controllers
+//                         still match; a controller that sees no `;fw=` treats the board
+//                         as legacy (unknown capabilities). Capability names (lowercase,
+//                         comma-separated, no spaces):
+//                           stepper   M/C/S/X/E/D axis commands
+//                           io        digital input/output pins (CFG/GET/SET/CHG/STATE)
+//                           neopixel  CFG type N + NEO       (not on this board)
+//                           loadcell  CFG type L + LC stream (not on this board)
 //    OK                   Command accepted
 //    DONE:<axis>          Indexed M move complete
 //    STATE:<pin>,<I|O>,<val>;...   Full IO state (response to GET)
@@ -43,6 +52,11 @@
 //    Enable = D8 (active LOW, shared)
 
 #define DEVICE_ID   "AUX_STEPPER_001"
+// Firmware version (semantic): bump patch for fixes, minor when a capability/command is
+// added, major when the protocol changes incompatibly. 1.0.0 is the un-versioned firmware.
+#define FW_VERSION  "1.1.0"
+// Capabilities advertised in the ID? reply (see protocol block above).
+#define FW_CAPS     "stepper,io"
 #define SERIAL_BAUD 115200
 #define MAX_AXES    4
 #define RX_BUF_SIZE 64
@@ -206,7 +220,8 @@ static void emitIoState()
 
 static void handleCommand(const char* line)
 {
-    if (strcmp(line, "ID?") == 0) { Serial.println("ID:" DEVICE_ID); return; }
+    // One line; literals concatenated at compile time, no allocation.
+    if (strcmp(line, "ID?") == 0) { Serial.println("ID:" DEVICE_ID ";fw=" FW_VERSION ";caps=" FW_CAPS); return; }
 
     // Edge-device IO commands. Checked before the single-letter guard below, which
     // would otherwise ERR these multi-letter commands (SET: vs the stepper S: differ
