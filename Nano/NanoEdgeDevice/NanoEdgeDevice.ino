@@ -5,9 +5,10 @@
 // Serial protocol (115200 baud, newline-terminated ASCII lines):
 //
 //  HOST → NANO
-//    ID?                         Request device identifier
+//    ID?                         Request device identifier, firmware version and capabilities
 //    GET                         Get full state of all configured pins
 //    CFG:<pin>,<type>[,<opt>...] Configure pin  (I=Input, O=Output, N=Neopixel)
+//    CFG:<dtPin>,L,<sckPin>      Configure HX711 load cell (DT=dtPin, SCK=sckPin)
 //    SET:<pin>,<val>             Set digital output (val: 0 or 1)
 //    NEO:<pin>,<r0>,<g0>,<b0>,<r1>,<g1>,<b1>,...  Set neopixel pixel colours
 //
@@ -30,14 +31,29 @@
 //    READY:<identifier>          Sent once from setup(), so a reset announces
 //                                itself instead of being discovered by polling.
 //                                Every pin is unconfigured when this appears.
-//    ID:<identifier>             Response to ID?
-//    STATE:<pin>,<t>,<v>;...     Full pin state (t: I/O/N, v: 0 or 1)
+//    ID:<identifier>;fw=<major.minor.patch>;caps=<cap1,cap2,...>
+//                                Response to ID? — one line. The `ID:<identifier>` prefix is
+//                                byte-for-byte what pre-1.1.0 firmware sent, so old controllers
+//                                still match; a controller that sees no `;fw=` treats the board
+//                                as legacy (unknown capabilities). Capability names (lowercase,
+//                                comma-separated, no spaces):
+//                                  io        digital input/output pins (CFG/GET/SET/CHG/STATE)
+//                                  neopixel  CFG type N + NEO
+//                                  loadcell  CFG type L + LC streaming
+//                                  stepper   M/C/S/X/E/D axis commands (not on this board)
+//    STATE:<pin>,<t>,<v>;...     Full pin state (t: I/O/N, v: 0 or 1; L: v is raw count)
 //    CHG:<pin>,<val>             Input pin changed value
+//    LC:<pin>,<raw>              HX711 load-cell raw 24-bit reading (signed), streamed each sample
 //    !ERR:<cmd>,<pin>,<reason>   A command was refused. Nothing was silently
 //                                dropped, so the host does not have to poll to
 //                                find out a write went nowhere.
 //    !FAILSAFE                   The host went quiet and every HOLD=0 pin was
 //                                released to its INIT level.
+//
+// Load cell: the Nano streams RAW counts only; the controller applies the tare offset + scale to
+// get grams (calibration lives controller-side). Reads are non-blocking (only when the HX711 has a
+// sample ready, i.e. DT is LOW), so they never stall the loop. Sample rate is set by the HX711 RATE
+// pin wiring (10 SPS default, 80 SPS if RATE is tied high) — the firmware reads whatever is produced.
 //
 // Requires: Adafruit NeoPixel library
 // ─────────────────────────────────────────────────────────────────────────────
@@ -48,6 +64,12 @@
 
 // Change this identifier to match the nano_config.json entry for this device.
 #define DEVICE_ID "ROBOT_NANO_001"
+
+// Firmware version (semantic): bump patch for fixes, minor when a capability/command is
+// added, major when the protocol changes incompatibly. 1.0.0 is the un-versioned firmware.
+#define FW_VERSION "1.1.0"
+// Capabilities advertised in the ID? reply (see protocol block above).
+#define FW_CAPS    "io,neopixel,loadcell"
 
 #define SERIAL_BAUD     115200
 
@@ -75,6 +97,7 @@
 #define MODE_INPUT         1
 #define MODE_OUTPUT        2
 #define MODE_NEOPIXEL      3
+#define MODE_LOADCELL      4
 
 // ── Per-pin state ──────────────────────────────────────────────────────────────
 
@@ -86,6 +109,8 @@ struct PinState {
     uint8_t           hold;         // 1 = keep state when the host goes quiet
     uint16_t          debounceMs;   // input only, 0 = report immediately
     Adafruit_NeoPixel* strip;       // neopixel only, heap-allocated
+    uint8_t           sckPin;       // loadcell only: HX711 clock pin
+    long              raw;          // loadcell only: latest raw 24-bit reading (signed)
 };
 
 static PinState      pins[MAX_PINS];
@@ -119,6 +144,8 @@ void checkInputChanges();
 void checkFailsafe();
 void configurePin(int pin, char typeChar, int pixelCount,
                   uint8_t initLevel, uint8_t hold, uint16_t debounceMs);
+void pollLoadCells();
+long readHx711(uint8_t dtPin, uint8_t sckPin);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // setup / loop
@@ -175,6 +202,9 @@ void loop()
         checkInputChanges();
     }
 
+    // ── Poll load cells (non-blocking: reads only when a sample is ready) ──────
+    pollLoadCells();
+
     // ── Release anything that asked not to be left latched ───────────────────
     checkFailsafe();
 }
@@ -190,7 +220,8 @@ void handleCommand(char* line)
     lastCommandMs = millis();
 
     if (strcmp(line, "ID?") == 0) {
-        Serial.println("ID:" DEVICE_ID);
+        // One line; literals concatenated at compile time, no String allocation.
+        Serial.println("ID:" DEVICE_ID ";fw=" FW_VERSION ";caps=" FW_CAPS);
         return;
     }
 
@@ -221,7 +252,7 @@ void handleConfigure(char* body)
     if (typeTok == NULL) { sendError("CFG", pin, "NOTYPE"); return; }
 
     char typeChar = typeTok[0];
-    if (typeChar != 'I' && typeChar != 'O' && typeChar != 'N') {
+    if (typeChar != 'I' && typeChar != 'O' && typeChar != 'N' && typeChar != 'L') {
         sendError("CFG", pin, "TYPE");
         return;
     }
@@ -231,14 +262,15 @@ void handleConfigure(char* body)
     uint8_t  hold       = 1;
     uint16_t debounceMs = 0;
     int      pixelCount = 8;
+    bool     positional = false;
 
     for (char* opt = strtok_r(NULL, ",", &save); opt != NULL;
          opt = strtok_r(NULL, ",", &save)) {
 
         char* equals = strchr(opt, '=');
 
-        // No "=", so this is an older host's positional pixel count
-        if (equals == NULL) { pixelCount = atoi(opt); continue; }
+        // No "=": an older host's positional pixel count, or a load cell's SCK pin
+        if (equals == NULL) { pixelCount = atoi(opt); positional = true; continue; }
 
         *equals = '\0';
         const char* key   = opt;
@@ -249,6 +281,12 @@ void handleConfigure(char* body)
         else if (strcmp(key, "DEB")  == 0) debounceMs = (uint16_t)atoi(value);
         else if (strcmp(key, "PIX")  == 0) pixelCount = atoi(value);
         else                               sendError("CFG", pin, "BADOPT");
+    }
+
+    // A load cell's SCK pin is required and positional (CFG:<dt>,L,<sck>)
+    if (typeChar == 'L' && (!positional || pixelCount < 0 || pixelCount >= MAX_PINS || pixelCount == pin)) {
+        sendError("CFG", pin, "NOSCK");
+        return;
     }
 
     configurePin(pin, typeChar, pixelCount, initLevel, hold, debounceMs);
@@ -379,6 +417,16 @@ void configurePin(int pin, char typeChar, int pixelCount,
         pins[pin].strip->begin();
         pins[pin].strip->clear();
         pins[pin].strip->show();
+
+    } else if (typeChar == 'L') {
+        // HX711 load cell: `pin` is the DT (data) line, `pixelCount` carries the SCK (clock) line.
+        int sck = pixelCount;   // range-checked by handleConfigure
+        pins[pin].mode   = MODE_LOADCELL;
+        pins[pin].sckPin = (uint8_t)sck;
+        pins[pin].raw    = 0;
+        pinMode(pin, INPUT);        // DT: driven by the HX711
+        pinMode(sck, OUTPUT);
+        digitalWrite(sck, LOW);     // SCK low keeps the HX711 awake (a long HIGH powers it down)
     }
 }
 
@@ -401,12 +449,14 @@ void sendFullState()
         if      (pins[i].mode == MODE_INPUT)    typeChar = 'I';
         else if (pins[i].mode == MODE_OUTPUT)   typeChar = 'O';
         else if (pins[i].mode == MODE_NEOPIXEL) typeChar = 'N';
+        else if (pins[i].mode == MODE_LOADCELL) typeChar = 'L';
 
         Serial.print(i);
         Serial.print(',');
         Serial.print(typeChar);
         Serial.print(',');
-        Serial.print(pins[i].value);
+        // Load cells report their latest raw 24-bit count; everything else its 0/1 value.
+        Serial.print(pins[i].mode == MODE_LOADCELL ? pins[i].raw : (long)pins[i].value);
     }
 
     Serial.println();
@@ -420,6 +470,43 @@ void sendError(const char* command, int pin, const char* reason)
     if (pin >= 0) Serial.print(pin);
     Serial.print(',');
     Serial.println(reason);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HX711 load cell
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Shift one 24-bit sample out of the HX711 (MSB first), then a 25th pulse to select
+// gain 128 / channel A for the next conversion. Sign-extends to a 32-bit long. The caller
+// must only invoke this when DT is LOW (a sample is ready), so it never blocks waiting.
+long readHx711(uint8_t dtPin, uint8_t sckPin)
+{
+    long value = 0;
+    for (uint8_t i = 0; i < 24; i++) {
+        digitalWrite(sckPin, HIGH);
+        value = (value << 1) | (digitalRead(dtPin) ? 1 : 0);
+        digitalWrite(sckPin, LOW);
+    }
+    // 25th pulse: set channel A, gain 128 for the next reading.
+    digitalWrite(sckPin, HIGH);
+    digitalWrite(sckPin, LOW);
+    // Sign-extend the 24-bit two's-complement value.
+    if (value & 0x800000L) value |= 0xFF000000L;
+    return value;
+}
+
+// Read each configured load cell whenever it has a fresh sample ready and stream the raw count.
+void pollLoadCells()
+{
+    for (int i = 0; i < MAX_PINS; i++) {
+        if (pins[i].mode != MODE_LOADCELL) continue;
+        if (digitalRead(i) != LOW) continue;   // HX711 pulls DT low when a sample is ready
+        pins[i].raw = readHx711((uint8_t)i, pins[i].sckPin);
+        Serial.print("LC:");
+        Serial.print(i);
+        Serial.print(',');
+        Serial.println(pins[i].raw);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
